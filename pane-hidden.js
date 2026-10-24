@@ -142,7 +142,8 @@ async function performWrite(expectedKey) {
       ws.getRange('C' + n + ':F' + n).values = [[P.norm(it.booking), Number(it.quantity), P.norm(it.type), it.comment ? String(it.comment) : '']];
       const g = ws.getRange('G' + n);
       g.values = [['pending']];
-      if (gFill && gFill !== '#FFFFFF') g.format.fill.color = gFill;
+      // Always use the book's standard pending fill, regardless of template/release color.
+      g.format.fill.color = '#FFF2CC';
       if (gAlign && gAlign !== 'General') g.format.horizontalAlignment = gAlign;
       if (it.voyage) ws.getRange('H' + n).values = [[String(it.voyage)]];
       ws.getRange('K' + n).values = [[String(it.port).trim()]];
