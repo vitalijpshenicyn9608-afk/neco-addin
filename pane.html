@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NECO Test</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#182b45;background:#f1f5f9;margin:0;padding:16px}
+  h1{font-size:17px;margin:0 0 4px}
+  .muted{color:#64748b;font-size:12px}
+  .panel{background:#fff;border:1px solid #dfe8f3;border-radius:10px;padding:12px;margin:12px 0}
+  button{width:100%;padding:11px;margin:6px 0;background:#195fbd;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
+  button.write{background:#148359}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  input{padding:8px;border:1px solid #cdd5e0;border-radius:6px;width:90%}
+  pre{white-space:pre-wrap;word-break:break-word;font:12px Consolas,monospace;margin:6px 0 0;max-height:320px;overflow:auto}
+  .err{color:#b02828}
+  .warn{background:#fff6df;padding:9px;border-radius:8px;font-size:12px}
+</style>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script defer src="pane.js"></script>
+</head>
+<body>
+  <h1>NECO · TEST</h1>
+  <div class="muted">Только тестовый клон книги</div>
+
+  <div class="panel">
+    <b>Шаг 1. Диагностика (только чтение)</b>
+    <button id="diag">Прочитать лист</button>
+    <pre id="diagOut">Нажмите кнопку. Ничего не записывается.</pre>
+  </div>
+
+  <div class="panel">
+    <b>Шаг 2. Тестовая запись в одну ячейку</b>
+    <p class="warn">Сначала щёлкните в книге на ПУСТУЮ ячейку далеко от данных (например, ниже таблицы). Потом напишите ТЕСТ и нажмите кнопку. Записанный текст «NECO-TEST» потом удалите вручную.</p>
+    <input id="confirm" placeholder="ТЕСТ" autocomplete="off">
+    <button id="write" class="write">Записать NECO-TEST в выбранную ячейку</button>
+    <pre id="writeOut"></pre>
+  </div>
+
+  <div id="error" class="err" role="alert"></div>
+</body>
+</html>
