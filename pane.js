@@ -1,15 +1,16 @@
-/* NECO Booking add-in. Запись только в пустые строки, с повторной проверкой и перечитыванием. */
+/* NECO Booking add-in v1.7 beta. Запись только в пустые строки, с повторной проверкой и перечитыванием.
+   Два входа: ручной (вставка из буфера) и автоматический (сообщение SUBMIT от расширения-курьера). */
 'use strict';
 
 // ---- Настройки ----------------------------------------------------------
 // Часть имени файла, в который разрешена запись. Для тестов — клон «ПРОБА».
-// Когда решите работать с настоящей книгой, замените на её имя (одной строкой) и перезалейте pane.js.
 const EXPECTED_FILE_PART = 'ПРОБА';
 // Сколько последних строк листа читать для проверок (дубли за 5 дней и поиск свободной строки).
 const WINDOW_ROWS = 2000;
-// Копировать оформление строки целиком с последней занятой строки (границы и т.п.).
-// По умолчанию ВЫКЛЮЧЕНО: сначала проверьте на клоне, что условное форматирование столбца C не страдает.
-const COPY_ROW_FORMATS = false;
+// Формат даты в столбце A.
+const DATE_FORMAT = 'dd.mm.yyyy';
+// Переносить оформление (границы, заливки, форматы) с последней строки со статусом pending.
+const COPY_ROW_FORMATS = true;
 // ------------------------------------------------------------------------
 
 const P = NecoPlanner;
@@ -17,6 +18,7 @@ const el = id => document.getElementById(id);
 let payload = null;
 let shownPlanKey = '';
 let busy = false;
+const handledJobs = new Set();
 
 const showErr = m => { el('error').textContent = m || ''; };
 function planKey(pl) { return pl.results.map(r => r.kind + ':' + (r.row || '-') + ':' + P.key(r.item)).join(';'); }
@@ -38,7 +40,6 @@ function checkEnv() {
   }
 }
 
-// Читает целевой лист: защита, заголовки, окно последних строк.
 async function readSheet(ctx, name) {
   const ws = ctx.workbook.worksheets.getItemOrNullObject(name);
   ws.load('isNullObject,name');
@@ -66,6 +67,17 @@ async function readSheet(ctx, name) {
   return { ws, first, last, values: win.values };
 }
 
+// Число правил условного форматирования в столбце C (для контроля после копирования оформления).
+async function cfCountC(name) {
+  try {
+    return await Excel.run(async ctx => {
+      const c = ctx.workbook.worksheets.getItem(name).getRange('C:C').conditionalFormats.getCount();
+      await ctx.sync();
+      return c.value;
+    });
+  } catch (e) { return null; }
+}
+
 async function buildPlan() {
   checkEnv();
   return Excel.run(async ctx => {
@@ -82,6 +94,88 @@ async function check() {
   el('plan').textContent = 'Лист: ' + payload.sheet + '\n' + labelPlan(pl);
   el('write').disabled = pl.added === 0;
   if (pl.added === 0) el('result').textContent = 'Все строки уже есть в таблице. Записывать нечего.';
+}
+
+class StaleError extends Error {}
+
+// Общая запись. expectedKey === null — автоматический режим (без сверки с показанным планом).
+async function performWrite(expectedKey) {
+  checkEnv();
+  const today = new Date();
+  const serial = P.excelSerial(today);
+  const cfBefore = await cfCountC(payload.sheet);
+  let out = null;
+
+  await Excel.run(async ctx => {
+    // Читаем заново прямо перед записью: за это время таблицу мог изменить коллега.
+    const st = await readSheet(ctx, payload.sheet);
+    const pl = P.plan(st.values, st.first, payload, today, today);
+    if (expectedKey !== null && planKey(pl) !== expectedKey) {
+      shownPlanKey = planKey(pl);
+      el('plan').textContent = 'Лист: ' + payload.sheet + '\n' + labelPlan(pl);
+      throw new StaleError('Таблица изменилась с момента проверки. Ничего не записано: проверьте новый план и нажмите «Записать» ещё раз.');
+    }
+    if (!pl.added) { out = { pl, warnings: [], written: 0 }; return; }
+
+    const ws = st.ws;
+    const tpl = pl.gTemplate || pl.lastData;      // строка-образец оформления
+    let gTpl = null;
+    if (pl.gTemplate) {
+      gTpl = ws.getRange('G' + pl.gTemplate);
+      gTpl.format.fill.load('color');
+      gTpl.format.load('horizontalAlignment');
+      await ctx.sync();
+    }
+    const gFill = gTpl ? gTpl.format.fill.color : null;
+    const gAlign = gTpl ? gTpl.format.horizontalAlignment : null;
+
+    ws.activate();
+    for (const r of pl.results) {
+      if (r.kind !== 'new') continue;
+      const n = r.row, it = r.item;
+      if (COPY_ROW_FORMATS) {
+        ws.getRange('A' + n + ':M' + n).copyFrom('A' + tpl + ':M' + tpl, Excel.RangeCopyType.formats);
+      }
+      const a = ws.getRange('A' + n);
+      a.values = [[serial]];
+      a.numberFormat = [[DATE_FORMAT]];
+      ws.getRange('C' + n + ':F' + n).values = [[P.norm(it.booking), Number(it.quantity), P.norm(it.type), it.comment ? String(it.comment) : '']];
+      const g = ws.getRange('G' + n);
+      g.values = [['pending']];
+      if (gFill && gFill !== '#FFFFFF') g.format.fill.color = gFill;
+      if (gAlign && gAlign !== 'General') g.format.horizontalAlignment = gAlign;
+      if (it.voyage) ws.getRange('H' + n).values = [[String(it.voyage)]];
+      ws.getRange('K' + n).values = [[String(it.port).trim()]];
+    }
+    await ctx.sync();
+
+    // Перечитываем записанное и сверяем.
+    const checks = [];
+    for (const r of pl.results) {
+      if (r.kind !== 'new') continue;
+      const rg = ws.getRange('A' + r.row + ':M' + r.row);
+      rg.load('values');
+      checks.push({ r, rg });
+    }
+    await ctx.sync();
+    const problems = [];
+    for (const { r, rg } of checks) {
+      const v = rg.values[0], it = r.item;
+      const ok = Number(v[0]) === serial && P.norm(v[2]) === P.norm(it.booking) && Number(v[3]) === Number(it.quantity) &&
+                 P.norm(v[4]) === P.norm(it.type) && P.norm(v[6]) === 'PENDING' && P.norm(v[10]) === P.norm(it.port);
+      if (!ok) problems.push(r.row);
+    }
+    if (problems.length) throw Error('Повторное чтение не совпало на строках: ' + problems.join(', ') + '. Возможно, одновременно писал коллега. Проверьте эти строки вручную.');
+    out = { pl, warnings: [], written: pl.added };
+  });
+
+  if (out && out.written && COPY_ROW_FORMATS) {
+    const cfAfter = await cfCountC(payload.sheet);
+    if (cfBefore !== null && cfAfter !== null && cfBefore !== cfAfter) {
+      out.warnings.push('Изменилось число правил условного форматирования в столбце C: было ' + cfBefore + ', стало ' + cfAfter + '. Проверьте книгу и сообщите разработчику.');
+    }
+  }
+  return out;
 }
 
 async function onPaste() {
@@ -107,79 +201,12 @@ async function write() {
   busy = true; el('write').disabled = true; showErr('');
   try {
     if (!payload || !shownPlanKey) throw Error('Сначала вставьте заявку и дождитесь проверки.');
-    checkEnv();
-    const today = new Date();
-    const serial = P.excelSerial(today);
-    let report = null;
-
-    await Excel.run(async ctx => {
-      // Читаем заново прямо перед записью: за это время таблицу мог изменить коллега.
-      const st = await readSheet(ctx, payload.sheet);
-      const pl = P.plan(st.values, st.first, payload, today, today);
-      if (planKey(pl) !== shownPlanKey) {
-        shownPlanKey = planKey(pl);
-        el('plan').textContent = 'Лист: ' + payload.sheet + '\n' + labelPlan(pl);
-        throw Error('Таблица изменилась с момента проверки. Ничего не записано: проверьте новый план и нажмите «Записать» ещё раз.');
-      }
-      if (!pl.added) throw Error('Все строки уже есть в таблице. Записывать нечего.');
-
-      const ws = st.ws;
-      // Образцы оформления с реальных строк.
-      const aTpl = ws.getRange('A' + pl.lastData);
-      aTpl.load('numberFormat');
-      let gTpl = null;
-      if (pl.gTemplate) {
-        gTpl = ws.getRange('G' + pl.gTemplate);
-        gTpl.format.fill.load('color');
-        gTpl.format.load('horizontalAlignment');
-      }
-      await ctx.sync();
-      const aFmt = aTpl.numberFormat[0][0];
-      const gFill = gTpl ? gTpl.format.fill.color : null;
-      const gAlign = gTpl ? gTpl.format.horizontalAlignment : null;
-
-      ws.activate();
-      for (const r of pl.results) {
-        if (r.kind !== 'new') continue;
-        const n = r.row, it = r.item;
-        if (COPY_ROW_FORMATS) {
-          ws.getRange('A' + n + ':M' + n).copyFrom('A' + pl.lastData + ':M' + pl.lastData, Excel.RangeCopyType.formats);
-        }
-        const a = ws.getRange('A' + n);
-        a.values = [[serial]];
-        if (aFmt) a.numberFormat = [[aFmt]];
-        ws.getRange('C' + n + ':F' + n).values = [[P.norm(it.booking), Number(it.quantity), P.norm(it.type), it.comment ? String(it.comment) : '']];
-        const g = ws.getRange('G' + n);
-        g.values = [['pending']];
-        if (gFill && gFill !== '#FFFFFF') g.format.fill.color = gFill;
-        if (gAlign && gAlign !== 'General') g.format.horizontalAlignment = gAlign;
-        if (it.voyage) ws.getRange('H' + n).values = [[String(it.voyage)]];
-        ws.getRange('K' + n).values = [[String(it.port).trim()]];
-      }
-      await ctx.sync();
-
-      // Перечитываем записанное и сверяем.
-      const checks = [];
-      for (const r of pl.results) {
-        if (r.kind !== 'new') continue;
-        const rg = ws.getRange('A' + r.row + ':M' + r.row);
-        rg.load('values');
-        checks.push({ r, rg });
-      }
-      await ctx.sync();
-      const problems = [];
-      for (const { r, rg } of checks) {
-        const v = rg.values[0], it = r.item;
-        const ok = Number(v[0]) === serial && P.norm(v[2]) === P.norm(it.booking) && Number(v[3]) === Number(it.quantity) &&
-                   P.norm(v[4]) === P.norm(it.type) && P.norm(v[6]) === 'PENDING' && P.norm(v[10]) === P.norm(it.port);
-        if (!ok) problems.push(r.row);
-      }
-      if (problems.length) throw Error('Повторное чтение не совпало на строках: ' + problems.join(', ') + '. Проверьте их вручную.');
-      report = labelPlan(pl);
-    });
-
+    const out = await performWrite(shownPlanKey);
+    if (!out.written) throw Error('Все строки уже есть в таблице. Записывать нечего.');
     el('result').className = 'ok';
-    el('result').textContent = 'Записано и перечитано.\n' + report + '\n\nПроверьте в заголовке Excel, что стоит «Сохранено».';
+    el('result').textContent = 'Записано и перечитано.\n' + labelPlan(out.pl) +
+      (out.warnings.length ? '\n\nВНИМАНИЕ:\n' + out.warnings.join('\n') : '') +
+      '\n\nПроверьте в заголовке Excel, что стоит «Сохранено».';
     el('paste').value = ''; payload = null; shownPlanKey = '';
     el('recheck').disabled = true;
   } catch (e) {
@@ -191,11 +218,57 @@ async function write() {
   }
 }
 
+// ---- Автоматический режим: сообщения от расширения-курьера (content script в этом же фрейме) ----
+function postResult(msg) { window.postMessage(Object.assign({ neco: 'RESULT' }, msg), location.origin); }
+
+async function autoSubmit(m) {
+  const id = String(m.id || '');
+  if (handledJobs.has(id)) { postResult({id, ok:false, code:'REPLAY', message:'Повторная доставка одной и той же заявки. Проверьте таблицу.'}); return; }
+  if (busy) { postResult({ id, ok: false, code: 'BUSY', message: 'Панель занята другой записью. Повторите через минуту.' }); return; }
+  busy = true; showErr('');
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(id)) throw Error('Некорректный ID заявки');
+    handledJobs.add(id);
+    payload = m.payload; shownPlanKey = '';
+    P.validatePayload(payload, new Date());
+    el('paste').value = ''; el('write').disabled = true; el('recheck').disabled = true;
+    el('plan').textContent = 'Получена заявка от программы...';
+    const out = await performWrite(null);
+    el('plan').textContent = 'Лист: ' + payload.sheet + '\n' + labelPlan(out.pl);
+    el('result').className = out.written ? 'ok' : '';
+    el('result').textContent = (out.written ? 'Записано автоматически и перечитано.' : 'Все строки уже есть в таблице.') +
+      (out.warnings.length ? '\n\nВНИМАНИЕ:\n' + out.warnings.join('\n') : '');
+    postResult({
+      id, ok: true, written: out.written, duplicates: out.pl.duplicates, warnings: out.warnings,
+      rows: out.pl.results.map(r => ({ booking: r.item.booking, port: r.item.port, quantity: Number(r.item.quantity), type: r.item.type, status: r.kind === 'new' ? 'written' : 'duplicate', row: r.row, why: r.why || '' }))
+    });
+  } catch (e) {
+    showErr(e.message);
+    postResult({ id, ok: false, code: 'ERROR', message: e.message });
+  } finally {
+    payload = null; shownPlanKey = ''; busy = false;
+  }
+}
+
+let officeIsReady = false;
+window.addEventListener('message', ev => {
+  if (ev.source !== window || ev.origin !== location.origin) return;   // только от content script этого же фрейма
+  const m = ev.data;
+  if (!m || typeof m !== 'object') return;
+  if (!officeIsReady) return;
+  if (m.neco === 'PING') {
+    let url = ''; try { url = docUrl(); } catch (e) { /* ignore */ }
+    window.postMessage({ neco: 'PONG', id: String(m.id || ''), url, busy }, location.origin);
+  } else if (m.neco === 'SUBMIT') {
+    autoSubmit(m);
+  }
+});
+
 Office.onReady(info => {
   if (info.host !== Office.HostType.Excel) { showErr('Откройте надстройку внутри Excel.'); return; }
+  officeIsReady = true;
   el('env').textContent = 'Книга: ' + (docUrl() || '(адрес не получен)');
-  const paste = el('paste');
-  paste.addEventListener('input', () => onPaste());
+  el('paste').addEventListener('input', () => onPaste());
   el('recheck').onclick = () => check().catch(e => showErr(e.message));
   el('write').onclick = () => write();
 });
