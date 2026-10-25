@@ -64,7 +64,7 @@ async function readSheet(ctx, name) {
   ws.load('isNullObject,name');
   await ctx.sync();
   if (ws.isNullObject) throw Error('В книге нет листа «' + name + '».');
-  ws.protection.load('protected');
+  ws.protection.load('protected,isPasswordProtected,isPaused');
   const used = ws.getUsedRange(true);
   used.load('rowIndex,rowCount');
   const head = ws.getRange('A1:M1');
@@ -75,7 +75,8 @@ async function readSheet(ctx, name) {
   const okHead = h[0].includes('ДАТА ЗАЯВКИ') && h[2].includes('НОМЕР БУКИНГА') && h[3].includes('КОЛИЧЕСТВО') &&
                  h[4].includes('ТИП') && h[6].includes('РЕЛИЗ') && h[10] === 'POL';
   if (!okHead) throw Error('Заголовки листа не совпадают со схемой A:M. Запись заблокирована.');
-  if (ws.protection.protected) throw Error('Лист «' + name + '» защищён. Запись заблокирована.');
+  // Чтение и предварительная проверка разрешены и на защищённых листах.
+  // На время ЗАПИСИ защита приостанавливается отдельно, без пароля, если это возможно.
 
   const last = used.rowIndex + used.rowCount;
   if (last < 3) throw Error('На листе почти нет данных: запись заблокирована.');
@@ -137,6 +138,22 @@ async function performWrite(expectedKey) {
     if (!pl.added) { out = { pl, warnings: [], written: 0 }; return; }
 
     const ws = st.ws;
+    // Office.js / Excel Online: временно приостанавливаем защиту ТОЛЬКО в своей сессии.
+    // Никакого глобального unprotect/protect, чтобы не открывать лист для других сотрудников.
+    let pausedHere = false;
+    let operationError = null;
+    try {
+      if (ws.protection.protected && !ws.protection.isPaused) {
+        if (ws.protection.isPasswordProtected) {
+          throw new Error('Лист защищён паролем. Автоматическая запись без пароля запрещена.');
+        }
+        if (typeof ws.protection.pauseProtection !== 'function') {
+          throw new Error('Текущий Excel не поддерживает временную приостановку защиты листа. Запись не начата.');
+        }
+        ws.protection.pauseProtection();
+        await ctx.sync();
+        pausedHere = true;
+      }
     const tpl = pl.gTemplate || pl.lastData;      // строка-образец оформления
     let gTpl = null;
     if (pl.gTemplate) {
@@ -187,6 +204,20 @@ async function performWrite(expectedKey) {
     }
     if (problems.length) throw Error('Повторное чтение не совпало на строках: ' + problems.join(', ') + '. Возможно, одновременно писал коллега. Проверьте эти строки вручную.');
     out = { pl, warnings: [], written: pl.added };
+    } catch (error) {
+      operationError = error;
+    } finally {
+      if (pausedHere) {
+        try {
+          ws.protection.resumeProtection();
+          await ctx.sync();
+        } catch (restoreError) {
+          const prefix = operationError ? (operationError.message + ' ') : '';
+          operationError = new Error(prefix + 'Не удалось возобновить защиту листа. Часть строк МОГЛА записаться — проверьте книгу вручную. ' + restoreError.message);
+        }
+      }
+    }
+    if (operationError) throw operationError;
   });
 
   if (out && out.written && COPY_ROW_FORMATS) {
