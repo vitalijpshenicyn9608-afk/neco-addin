@@ -35,8 +35,27 @@ function docUrl() { try { return decodeURIComponent(String(Office.context.docume
 function checkEnv() {
   const url = docUrl();
   if (!url) throw Error('Excel не сообщил адрес книги: запись заблокирована.');
-  if (!url.toUpperCase().includes(EXPECTED_FILE_PART.toUpperCase())) {
-    throw Error('Открыта не та книга. Ожидается файл, в имени которого есть «' + EXPECTED_FILE_PART + '». Сейчас: ' + url);
+  // Older manual payloads remain test-only; production requires an explicit binding.
+  const mode = payload && payload.workbookMode === 'main' ? 'main' : 'test';
+  if (mode === 'test') {
+    if (!url.toUpperCase().includes(EXPECTED_FILE_PART.toUpperCase())) {
+      throw Error('Тестовый режим разрешён только в книге ПРОБА. Открыто: ' + url);
+    }
+    return;
+  }
+  const expected = payload && String(payload.expectedWorkbookUrl || '').trim();
+  if (!expected || !expected.startsWith('https://')) {
+    throw Error('Основная книга не привязана в настройках NECO Booking Manager. Запись запрещена.');
+  }
+  const canonical = raw => {
+    const u = new URL(raw);
+    return u.origin.toLowerCase() + decodeURIComponent(u.pathname).replace(/\/$/, '').toUpperCase();
+  };
+  if (url.toUpperCase().includes(EXPECTED_FILE_PART.toUpperCase())) {
+    throw Error('Основной режим не может записывать в тестовую книгу ПРОБА.');
+  }
+  if (canonical(url) !== canonical(expected)) {
+    throw Error('Открыта ДРУГАЯ книга Excel. Ожидается ' + expected + '; открыто ' + url + '. Запись запрещена.');
   }
 }
 
